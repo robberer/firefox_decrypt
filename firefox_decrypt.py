@@ -29,6 +29,7 @@ import platform
 import sqlite3
 import sys
 import shutil
+import datetime
 from base64 import b64decode
 from getpass import getpass
 from itertools import chain
@@ -133,7 +134,7 @@ class Credentials:
 
         LOG.info("Using %s for credentials.", db)
 
-    def __iter__(self) -> Iterator[tuple[str, str, str, int]]:
+    def __iter__(self) -> Iterator[tuple[str, str, str, int, str, int, int, int, int]]:
         pass
 
     def done(self):
@@ -154,9 +155,11 @@ class SqliteCredentials(Credentials):
         self.conn = sqlite3.connect(db)
         self.c = self.conn.cursor()
 
-    def __iter__(self) -> Iterator[tuple[str, str, str, int]]:
+    def __iter__(self) -> Iterator[tuple[str, str, str, int, str, int, int, int, int]]:
         LOG.debug("Reading password database in SQLite format")
-        self.c.execute("SELECT hostname, encryptedUsername, encryptedPassword, encType "
+        self.c.execute("SELECT hostname, encryptedUsername, encryptedPassword, "
+                       "encType, guid, timeCreated, timeLastUsed, timePasswordChanged, "
+                        "timesUsed "
                        "FROM moz_logins")
         for i in self.c:
             # yields hostname, encryptedUsername, encryptedPassword, encType
@@ -179,7 +182,7 @@ class JsonCredentials(Credentials):
 
         super(JsonCredentials, self).__init__(db)
 
-    def __iter__(self) -> Iterator[tuple[str, str, str, int]]:
+    def __iter__(self) -> Iterator[tuple[str, str, str, int, str, int, int, int, int]]:
         with open(self.db) as fh:
             LOG.debug("Reading password database in JSON format")
             data = json.load(fh)
@@ -192,13 +195,15 @@ class JsonCredentials(Credentials):
 
             for i in logins:
                 yield (i["hostname"], i["encryptedUsername"],
-                       i["encryptedPassword"], i["encType"])
+                       i["encryptedPassword"], i["encType"],
+                       i["guid"], i["timeCreated"], i["timeLastUsed"],
+                       i["timePasswordChanged"], i["timesUsed"])
 
 
 def find_nss(locations, nssname) -> ct.CDLL:
     """Locate nss is one of the many possible locations
     """
-    fail_errors: list[tuple[str, str]] = []
+    fail_errors: list[tuple[str, str, str, int, str, int, int, int, int]] = []
 
     OS = ("Windows", "Darwin")
 
@@ -536,13 +541,18 @@ class MozillaInteraction:
         credentials: Credentials = self.obtain_credentials()
 
         LOG.info("Decrypting credentials")
-        outputs: list[dict[str, str]] = []
+        outputs: list[dict[str, str, str, int, int, int, int]] = []
 
         url: str
         user: str
         passw: str
         enctype: int
-        for url, user, passw, enctype in credentials:
+        guid: str
+        timeCreated: int
+        timeLastUsed: int
+        timePasswordChanged: int
+        timesUsed: int
+        for url, user, passw, enctype, guid, timeCreated, timeLastUsed, timePasswordChanged, timesUsed in credentials:
             # enctype informs if passwords need to be decrypted
             if enctype:
                 try:
@@ -557,7 +567,11 @@ class MozillaInteraction:
 
             LOG.debug("Decoded username '%s' and password '%s' for website '%s'", user, passw, url)
 
-            output = {"url": url, "user": user, "password": passw}
+            output = {"url": url, "user": user, "password": passw,
+                      "guid": guid, "timeCreated": timeCreated,
+                      "timeLastUsed": timeLastUsed,
+                      "timePasswordChanged": timePasswordChanged,
+                      "timesUsed": timesUsed}
             outputs.append(output)
 
         if not outputs:
@@ -600,6 +614,11 @@ class HumanOutputFormat(OutputFormat):
                 f"\nWebsite:   {output['url']}\n"
                 f"Username: '{output['user']}'\n"
                 f"Password: '{output['password']}'\n"
+                f"Guid: '{output['guid']}'\n"
+                f"timeLastUsed: '{output['timeLastUsed']}'\n"
+                f"timePasswordChanged: '{output['timePasswordChanged']}'\n"
+                f"timeCreated: '{output['timeCreated']}'\n"
+                f"timesUsed: '{output['timesUsed']}'\n"
             )
             sys.stdout.write(record)
 
@@ -621,7 +640,8 @@ class CSVOutputFormat(OutputFormat):
     def output(self):
         csv_writer = csv.DictWriter(
             sys.stdout,
-            fieldnames=["url", "user", "password"],
+            fieldnames=["url", "user", "password", "guid", "timeLastUsed", \
+                        "timePasswordChanged", "timeCreated", "timesUsed"],
             lineterminator="\n",
             delimiter=self.delimiter,
             quotechar=self.quotechar,
@@ -692,17 +712,30 @@ class PassOutputFormat(OutputFormat):
             url = record["url"]
             user = record["user"]
             passw = record["password"]
+            guid = record["guid"]
+            timeCreated = record["timeCreated"]
+            timeLastUsed = record["timeLastUsed"]
+            timePasswordChanged = record["timePasswordChanged"]
+            timesUsed = record["timesUsed"]
 
             # Keep track of web-address, username and passwords
             # If more than one username exists for the same web-address
             # the username will be used as name of the file
             address = urlparse(url)
 
+            data = (
+                "Guid: "+guid+"\n"+
+                "timeCreated: "+unix2date(timeCreated)+"\n"+
+                "timeLastUsed: "+unix2date(timeLastUsed)+"\n"+
+                "timePasswordChanged: "+unix2date(timePasswordChanged)+"\n"+
+                "timesUsed: "+str(timesUsed)
+            )
+
             if address.netloc not in self.to_export:
-                self.to_export[address.netloc] = {user: passw}
+                self.to_export[address.netloc] = {user: passw+"\n"+data}
 
             else:
-                self.to_export[address.netloc][user] = passw
+                self.to_export[address.netloc][user] = passw+"\n"+data
 
     def export(self):
         """Export given passwords to password store
@@ -1018,6 +1051,10 @@ def parse_sys_args() -> argparse.Namespace:
 
     return args
 
+def unix2date(ut):
+    date = str(datetime.datetime.fromtimestamp(ut/1000))
+
+    return date
 
 def setup_logging(args) -> None:
     """Setup the logging level and configure the basic logger
